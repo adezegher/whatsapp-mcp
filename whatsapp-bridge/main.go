@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"net/http"
 	"os"
@@ -40,15 +41,39 @@ type MessageStore struct {
 	db *sql.DB
 }
 
+// storeDir holds messages.db, whatsapp.db (the session keys) and downloaded
+// media. WHATSAPP_STORE_DIR overrides the default ./store (relative to the
+// working directory).
+var storeDir = "store"
+
+// ensureStoreDir creates the store directory owner-only (0700) and tightens
+// it if it already exists: whatsapp.db is a session secret.
+func ensureStoreDir() error {
+	if err := os.MkdirAll(storeDir, 0700); err != nil {
+		return err
+	}
+	return os.Chmod(storeDir, 0700)
+}
+
+// sqliteDSN is the go-sqlite3 DSN for a database file inside storeDir.
+func sqliteDSN(name string) string {
+	return "file:" + filepath.Join(storeDir, name) + "?_foreign_keys=on"
+}
+
+// privateFile sets an existing store file to 0600 (best effort).
+func privateFile(name string) {
+	_ = os.Chmod(filepath.Join(storeDir, name), 0600)
+}
+
 // Initialize message store
 func NewMessageStore() (*MessageStore, error) {
 	// Create directory for database if it doesn't exist
-	if err := os.MkdirAll("store", 0755); err != nil {
+	if err := ensureStoreDir(); err != nil {
 		return nil, fmt.Errorf("failed to create store directory: %v", err)
 	}
 
 	// Open SQLite database for messages
-	db, err := sql.Open("sqlite3", "file:store/messages.db?_foreign_keys=on")
+	db, err := sql.Open("sqlite3", sqliteDSN("messages.db"))
 	if err != nil {
 		return nil, fmt.Errorf("failed to open message database: %v", err)
 	}
@@ -265,21 +290,11 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 
 	if err != nil {
 		logger.Warnf("Failed to store message: %v", err)
-	} else {
-		// Log message reception
-		timestamp := msg.Info.Timestamp.Format("2006-01-02 15:04:05")
-		direction := "←"
-		if msg.Info.IsFromMe {
-			direction = "→"
-		}
-
-		// Log based on message type
-		if mediaType != "" {
-			fmt.Printf("[%s] %s %s: [%s: %s] %s\n", timestamp, direction, sender, mediaType, filename, content)
-		} else if content != "" {
-			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
-		}
+		return
 	}
+	// Metadata only: message text and sender never go to the log.
+	logger.Debugf("Stored message %s in %s (from_me=%v, media=%q, %d chars)",
+		msg.Info.ID, chatJID, msg.Info.IsFromMe, mediaType, len(content))
 }
 
 // DownloadMediaRequest represents the request body for the download media API
@@ -374,7 +389,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	var err error
 
 	// First, check if we already have this file
-	chatDir := fmt.Sprintf("store/%s", strings.ReplaceAll(chatJID, ":", "_"))
+	chatDir := filepath.Join(storeDir, filepath.Base(strings.ReplaceAll(chatJID, ":", "_")))
 	localPath := ""
 
 	// Get media info from the database
@@ -398,12 +413,16 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Create directory for the chat if it doesn't exist
-	if err := os.MkdirAll(chatDir, 0755); err != nil {
+	if err := os.MkdirAll(chatDir, 0700); err != nil {
 		return false, "", "", "", fmt.Errorf("failed to create chat directory: %v", err)
 	}
 
 	// Generate a local path for the file
-	localPath = fmt.Sprintf("%s/%s", chatDir, filename)
+	filename = filepath.Base(filename) // a document name from a chat must not leave chatDir
+	if filename == "." || filename == ".." || filename == string(filepath.Separator) {
+		return false, "", "", "", fmt.Errorf("bad media filename")
+	}
+	localPath = filepath.Join(chatDir, filename)
 
 	// Get absolute path
 	absPath, err := filepath.Abs(localPath)
@@ -422,7 +441,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("incomplete media information for download")
 	}
 
-	fmt.Printf("Attempting to download media for message %s in chat %s...\n", messageID, chatJID)
+	fmt.Printf("%s download media for message %s in chat %s\n", stamp(), messageID, chatJID)
 
 	// Extract direct path from URL
 	directPath := extractDirectPathFromURL(url)
@@ -459,11 +478,11 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Save the downloaded media to file
-	if err := os.WriteFile(localPath, mediaData, 0644); err != nil {
+	if err := os.WriteFile(localPath, mediaData, 0600); err != nil {
 		return false, "", "", "", fmt.Errorf("failed to save media file: %v", err)
 	}
 
-	fmt.Printf("Successfully downloaded %s media to %s (%d bytes)\n", mediaType, absPath, len(mediaData))
+	fmt.Printf("%s downloaded %s media to %s (%d bytes)\n", stamp(), mediaType, absPath, len(mediaData))
 	return true, mediaType, filename, absPath, nil
 }
 
@@ -540,82 +559,174 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
-	// Start the server
-	serverAddr := fmt.Sprintf(":%d", port)
-	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
+	// Start the server on the loopback interface only: never reachable from
+	// the network. It has no send endpoint; /api/download is the only route.
+	serverAddr := fmt.Sprintf("127.0.0.1:%d", port)
+	fmt.Printf("%s REST API (download only) on %s\n", stamp(), serverAddr)
 
 	// Run server in a goroutine so it doesn't block
 	go func() {
 		if err := http.ListenAndServe(serverAddr, nil); err != nil {
-			fmt.Printf("REST API server error: %v\n", err)
+			fmt.Printf("%s REST API server error: %v\n", stamp(), err)
 		}
 	}()
 }
 
-func main() {
-	// Set up logger
-	logger := waLog.Stdout("Client", "INFO", true)
-	logger.Infof("Starting WhatsApp client...")
+// Exit codes (launchd restarts the bridge after any exit; see ThrottleInterval).
+const (
+	exitOK         = 0
+	exitUsage      = 2
+	exitNotLinked  = 3 // no session in the store and no terminal to show a QR
+	exitLoggedOut  = 4 // WhatsApp removed this linked device
+	exitStoreError = 5
+	exitConnect    = 6 // could not connect (network, or "Client outdated (405)": rebuild with a newer whatsmeow)
+)
 
-	// Create database connection for storing session data
-	dbLog := waLog.Stdout("Database", "INFO", true)
+// notLinkedWait keeps an unlinked bridge under launchd from restarting in a
+// tight loop: it logs once, waits, then exits exitNotLinked.
+const notLinkedWait = 10 * time.Minute
+
+// stamp is the timestamp prefix for plain log lines: local time with offset.
+func stamp() string { return time.Now().Format("2006-01-02T15:04:05.000-07:00") }
+
+// lineLogger is a whatsmeow logger for a launchd log file: full date and
+// offset on every line, no colour codes, one line per entry.
+type lineLogger struct {
+	mod   string
+	debug bool
+}
+
+func (l *lineLogger) out(level, msg string, args ...any) {
+	text := strings.ReplaceAll(fmt.Sprintf(msg, args...), "\n", " ")
+	fmt.Fprintf(os.Stdout, "%s [%s %s] %s\n", stamp(), l.mod, level, text)
+}
+func (l *lineLogger) Errorf(msg string, args ...any) { l.out("ERROR", msg, args...) }
+func (l *lineLogger) Warnf(msg string, args ...any)  { l.out("WARN", msg, args...) }
+func (l *lineLogger) Infof(msg string, args ...any)  { l.out("INFO", msg, args...) }
+func (l *lineLogger) Debugf(msg string, args ...any) {
+	if l.debug {
+		l.out("DEBUG", msg, args...)
+	}
+}
+func (l *lineLogger) Sub(mod string) waLog.Logger {
+	return &lineLogger{mod: l.mod + "/" + mod, debug: l.debug}
+}
+
+// isTerminal reports whether stdout is a terminal (Terminal.app) rather than
+// a launchd log file.
+func isTerminal() bool {
+	fi, err := os.Stdout.Stat()
+	return err == nil && fi.Mode()&os.ModeCharDevice != 0
+}
+
+func main() {
+	link := flag.Bool("link", false, "pair with the phone: print the QR code to this terminal if the store has no session")
+	debug := flag.Bool("debug", false, "log debug lines (message ids and chat names, never message text)")
+	port := flag.Int("port", 8080, "REST API port on 127.0.0.1 (download only)")
+	flag.Usage = func() {
+		fmt.Fprintf(flag.CommandLine.Output(), `Usage: %s [-link] [-debug] [-port N]
+
+Read-only WhatsApp bridge for James. Links as a companion device, stores
+chats and messages in $WHATSAPP_STORE_DIR/messages.db (default ./store),
+and serves /api/download on 127.0.0.1 only. It has no send path.
+
+Without a session it prints the pairing QR only when stdout is a terminal
+or -link is given; under launchd it logs "not linked" and exits %d.
+
+Exit codes: 0 ok, 2 usage, 3 not linked, 4 logged out, 5 store error, 6 connect failure.
+
+`, os.Args[0], exitNotLinked)
+		flag.PrintDefaults()
+	}
+	flag.Parse()
+	if flag.NArg() > 0 {
+		flag.Usage()
+		os.Exit(exitUsage)
+	}
+	if dir := os.Getenv("WHATSAPP_STORE_DIR"); dir != "" {
+		storeDir = dir
+	}
+
+	logger := &lineLogger{mod: "Client", debug: *debug}
+	dbLog := &lineLogger{mod: "Database", debug: *debug}
+	fail := func(code int, msg string, args ...any) {
+		logger.Errorf(msg, args...)
+		os.Exit(code)
+	}
+	logger.Infof("Starting WhatsApp bridge (read-only), store %s", storeDir)
 
 	// Create directory for database if it doesn't exist
-	if err := os.MkdirAll("store", 0755); err != nil {
-		logger.Errorf("Failed to create store directory: %v", err)
-		return
+	if err := ensureStoreDir(); err != nil {
+		fail(exitStoreError, "Failed to create store directory: %v", err)
 	}
 
-	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", sqliteDSN("whatsapp.db"), dbLog)
 	if err != nil {
-		logger.Errorf("Failed to connect to database: %v", err)
-		return
+		fail(exitStoreError, "Failed to open session database: %v", err)
 	}
+	privateFile("whatsapp.db")
 
 	// Get device store - This contains session information
 	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
-			// No device exists, create one
 			deviceStore = container.NewDevice()
 			logger.Infof("Created new device")
 		} else {
-			logger.Errorf("Failed to get device: %v", err)
-			return
+			fail(exitStoreError, "Failed to get device: %v", err)
 		}
+	}
+
+	// Refuse to sit unlinked under launchd: a QR printed into a log file is
+	// useless, and nobody can scan it.
+	if deviceStore.ID == nil && !*link && !isTerminal() {
+		logger.Errorf("Not linked: run `bin/james-whatsapp link` in Terminal and scan the QR from WhatsApp > Linked devices. Waiting %s before exiting.", notLinkedWait)
+		time.Sleep(notLinkedWait)
+		os.Exit(exitNotLinked)
 	}
 
 	// Create client instance
 	client := whatsmeow.NewClient(deviceStore, logger)
 	if client == nil {
-		logger.Errorf("Failed to create WhatsApp client")
-		return
+		fail(exitConnect, "Failed to create WhatsApp client")
 	}
 
 	// Initialize message store
 	messageStore, err := NewMessageStore()
 	if err != nil {
-		logger.Errorf("Failed to initialize message store: %v", err)
-		return
+		fail(exitStoreError, "Failed to initialize message store: %v", err)
 	}
+	privateFile("messages.db")
 	defer messageStore.Close()
 
 	// Setup event handling for messages and history sync
 	client.AddEventHandler(func(evt interface{}) {
 		switch v := evt.(type) {
 		case *events.Message:
-			// Process regular messages
 			handleMessage(client, messageStore, v, logger)
 
 		case *events.HistorySync:
-			// Process history sync events
 			handleHistorySync(client, messageStore, v, logger)
 
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
 
+		case *events.Disconnected:
+			logger.Warnf("Disconnected from WhatsApp (auto-reconnect is on)")
+
+		case *events.ClientOutdated:
+			logger.Errorf("Client outdated (405): rebuild the bridge against a newer whatsmeow")
+
+		case *events.StreamReplaced:
+			logger.Errorf("Stream replaced: another process opened this session; run only one bridge per store")
+
+		case *events.TemporaryBan:
+			logger.Errorf("Temporary ban from WhatsApp: %v", v)
+
 		case *events.LoggedOut:
-			logger.Warnf("Device logged out, please scan QR code to log in again")
+			logger.Errorf("Device logged out by WhatsApp (reason %v); exiting. Re-link with `bin/james-whatsapp link`.", v.Reason)
+			messageStore.Close()
+			os.Exit(exitLoggedOut)
 		}
 	})
 
@@ -628,35 +739,34 @@ func main() {
 		qrChan, _ := client.GetQRChannel(context.Background())
 		err = client.Connect()
 		if err != nil {
-			logger.Errorf("Failed to connect: %v", err)
-			return
+			fail(exitConnect, "Failed to connect: %v", err)
 		}
 
 		// Print QR code for pairing with phone
 		for evt := range qrChan {
 			if evt.Event == "code" {
-				fmt.Println("\nScan this QR code with your WhatsApp app:")
+				fmt.Println("\nScan this QR code with your WhatsApp app (Settings > Linked devices > Link a device):")
 				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
 			} else if evt.Event == "success" {
 				connected <- true
 				break
+			} else {
+				logger.Infof("Pairing: %s", evt.Event)
 			}
 		}
 
 		// Wait for connection
 		select {
 		case <-connected:
-			fmt.Println("\nSuccessfully connected and authenticated!")
+			logger.Infof("Linked and authenticated. History may take several minutes to arrive.")
 		case <-time.After(3 * time.Minute):
-			logger.Errorf("Timeout waiting for QR code scan")
-			return
+			fail(exitNotLinked, "Timeout waiting for QR code scan")
 		}
 	} else {
 		// Already logged in, just connect
 		err = client.Connect()
 		if err != nil {
-			logger.Errorf("Failed to connect: %v", err)
-			return
+			fail(exitConnect, "Failed to connect: %v", err)
 		}
 		connected <- true
 	}
@@ -665,27 +775,24 @@ func main() {
 	time.Sleep(2 * time.Second)
 
 	if !client.IsConnected() {
-		logger.Errorf("Failed to establish stable connection")
-		return
+		fail(exitConnect, "Failed to establish stable connection")
 	}
 
-	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
+	logger.Infof("Connected; storing messages in %s", filepath.Join(storeDir, "messages.db"))
 
-	// Start REST API server
-	startRESTServer(client, messageStore, 8080)
+	// Start REST API server (loopback, download only)
+	startRESTServer(client, messageStore, *port)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
 	signal.Notify(exitChan, syscall.SIGINT, syscall.SIGTERM)
 
-	fmt.Println("REST server is running. Press Ctrl+C to disconnect and exit.")
-
 	// Wait for termination signal
 	<-exitChan
 
-	fmt.Println("Disconnecting...")
-	// Disconnect client
+	logger.Infof("Disconnecting")
 	client.Disconnect()
+	// returning runs the deferred messageStore.Close(); exit status exitOK
 }
 
 // GetChatName determines the appropriate name for a chat based on JID and other info
@@ -695,7 +802,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 	err := messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID).Scan(&existingName)
 	if err == nil && existingName != "" {
 		// Chat exists with a name, use that
-		logger.Infof("Using existing chat name for %s: %s", chatJID, existingName)
+		logger.Debugf("Using existing chat name for %s: %s", chatJID, existingName)
 		return existingName
 	}
 
@@ -704,7 +811,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 	if jid.Server == "g.us" {
 		// This is a group chat
-		logger.Infof("Getting name for group: %s", chatJID)
+		logger.Debugf("Getting name for group: %s", chatJID)
 
 		// Use conversation data if provided (from history sync)
 		if conversation != nil {
@@ -748,10 +855,10 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 			}
 		}
 
-		logger.Infof("Using group name: %s", name)
+		logger.Debugf("Using group name: %s", name)
 	} else {
 		// This is an individual contact
-		logger.Infof("Getting name for contact: %s", chatJID)
+		logger.Debugf("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name)
 		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
@@ -765,7 +872,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 			name = jid.User
 		}
 
-		logger.Infof("Using contact name: %s", name)
+		logger.Debugf("Using contact name: %s", name)
 	}
 
 	return name
@@ -773,7 +880,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 // Handle history sync events
 func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, historySync *events.HistorySync, logger waLog.Logger) {
-	fmt.Printf("Received history sync event with %d conversations\n", len(historySync.Data.Conversations))
+	logger.Infof("History sync event with %d conversations", len(historySync.Data.Conversations))
 
 	syncedCount := 0
 	for _, conversation := range historySync.Data.Conversations {
@@ -838,9 +945,6 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength = extractMediaInfo(msg.Message.Message)
 				}
 
-				// Log the message content for debugging
-				logger.Infof("Message content: %v, Media Type: %v", content, mediaType)
-
 				// Skip messages with no content and no media
 				if content == "" && mediaType == "" {
 					continue
@@ -897,18 +1001,10 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					logger.Warnf("Failed to store history message: %v", err)
 				} else {
 					syncedCount++
-					// Log successful message storage
-					if mediaType != "" {
-						logger.Infof("Stored message: [%s] %s -> %s: [%s: %s] %s",
-							timestamp.Format("2006-01-02 15:04:05"), sender, chatJID, mediaType, filename, content)
-					} else {
-						logger.Infof("Stored message: [%s] %s -> %s: %s",
-							timestamp.Format("2006-01-02 15:04:05"), sender, chatJID, content)
-					}
 				}
 			}
 		}
 	}
 
-	fmt.Printf("History sync complete. Stored %d messages.\n", syncedCount)
+	logger.Infof("History sync complete. Stored %d messages.", syncedCount)
 }

@@ -1,5 +1,16 @@
 # WhatsApp MCP Server
 
+> **Branch `james-readonly` (fork for James).** The Go bridge on this branch cannot send:
+> `/api/send`, every send/upload function and the history-sync request are deleted, not stubbed.
+> It runs whatsmeow `v0.0.0-20261017175727-b2b1e71d45e2` (upstream PR #381), `go 1.27.3`,
+> binds its REST API (only `/api/download`) to `127.0.0.1`, keeps the store in
+> `$WHATSAPP_STORE_DIR` (default `./store`, created 0700), and logs one dated line per entry
+> without message text. Pairing: run it in a terminal (or with `-link`) and scan the QR;
+> without a session and without a terminal it logs "not linked" and exits 3.
+> `-help` lists the flags and exit codes. The Python MCP server below is unchanged and is
+> **not used by James** (it still has send tools). Build:
+> `cd whatsapp-bridge && go build -o ~/.local/bin/james-whatsapp-bridge .`
+
 This is a Model Context Protocol (MCP) server for WhatsApp.
 
 With this you can search and read your personal Whatsapp messages (including images, videos, documents, and audio messages), search your contacts and send messages to either individuals or groups. You can also send media files including images, videos, documents, and audio messages.
