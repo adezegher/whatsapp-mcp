@@ -3,10 +3,8 @@ package main
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"flag"
 	"fmt"
-	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -41,8 +39,8 @@ type MessageStore struct {
 	db *sql.DB
 }
 
-// storeDir holds messages.db, whatsapp.db (the session keys) and downloaded
-// media. WHATSAPP_STORE_DIR overrides the default ./store (relative to the
+// storeDir holds messages.db and whatsapp.db (the session keys); the bridge
+// never downloads media. WHATSAPP_STORE_DIR overrides the default ./store (relative to the
 // working directory).
 var storeDir = "store"
 
@@ -297,20 +295,6 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		msg.Info.ID, chatJID, msg.Info.IsFromMe, mediaType, len(content))
 }
 
-// DownloadMediaRequest represents the request body for the download media API
-type DownloadMediaRequest struct {
-	MessageID string `json:"message_id"`
-	ChatJID   string `json:"chat_jid"`
-}
-
-// DownloadMediaResponse represents the response for the download media API
-type DownloadMediaResponse struct {
-	Success  bool   `json:"success"`
-	Message  string `json:"message"`
-	Filename string `json:"filename,omitempty"`
-	Path     string `json:"path,omitempty"`
-}
-
 // Store additional media info in the database
 func (store *MessageStore) StoreMediaInfo(id, chatJID, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
 	_, err := store.db.Exec(
@@ -318,258 +302,6 @@ func (store *MessageStore) StoreMediaInfo(id, chatJID, url string, mediaKey, fil
 		url, mediaKey, fileSHA256, fileEncSHA256, fileLength, id, chatJID,
 	)
 	return err
-}
-
-// Get media info from the database
-func (store *MessageStore) GetMediaInfo(id, chatJID string) (string, string, string, []byte, []byte, []byte, uint64, error) {
-	var mediaType, filename, url string
-	var mediaKey, fileSHA256, fileEncSHA256 []byte
-	var fileLength uint64
-
-	err := store.db.QueryRow(
-		"SELECT media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length FROM messages WHERE id = ? AND chat_jid = ?",
-		id, chatJID,
-	).Scan(&mediaType, &filename, &url, &mediaKey, &fileSHA256, &fileEncSHA256, &fileLength)
-
-	return mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, err
-}
-
-// MediaDownloader implements the whatsmeow.DownloadableMessage interface
-type MediaDownloader struct {
-	URL           string
-	DirectPath    string
-	MediaKey      []byte
-	FileLength    uint64
-	FileSHA256    []byte
-	FileEncSHA256 []byte
-	MediaType     whatsmeow.MediaType
-}
-
-// GetDirectPath implements the DownloadableMessage interface
-func (d *MediaDownloader) GetDirectPath() string {
-	return d.DirectPath
-}
-
-// GetURL implements the DownloadableMessage interface
-func (d *MediaDownloader) GetURL() string {
-	return d.URL
-}
-
-// GetMediaKey implements the DownloadableMessage interface
-func (d *MediaDownloader) GetMediaKey() []byte {
-	return d.MediaKey
-}
-
-// GetFileLength implements the DownloadableMessage interface
-func (d *MediaDownloader) GetFileLength() uint64 {
-	return d.FileLength
-}
-
-// GetFileSHA256 implements the DownloadableMessage interface
-func (d *MediaDownloader) GetFileSHA256() []byte {
-	return d.FileSHA256
-}
-
-// GetFileEncSHA256 implements the DownloadableMessage interface
-func (d *MediaDownloader) GetFileEncSHA256() []byte {
-	return d.FileEncSHA256
-}
-
-// GetMediaType implements the DownloadableMessage interface
-func (d *MediaDownloader) GetMediaType() whatsmeow.MediaType {
-	return d.MediaType
-}
-
-// Function to download media from a message
-func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, messageID, chatJID string) (bool, string, string, string, error) {
-	// Query the database for the message
-	var mediaType, filename, url string
-	var mediaKey, fileSHA256, fileEncSHA256 []byte
-	var fileLength uint64
-	var err error
-
-	// First, check if we already have this file
-	chatDir := filepath.Join(storeDir, filepath.Base(strings.ReplaceAll(chatJID, ":", "_")))
-	localPath := ""
-
-	// Get media info from the database
-	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, err = messageStore.GetMediaInfo(messageID, chatJID)
-
-	if err != nil {
-		// Try to get basic info if extended info isn't available
-		err = messageStore.db.QueryRow(
-			"SELECT media_type, filename FROM messages WHERE id = ? AND chat_jid = ?",
-			messageID, chatJID,
-		).Scan(&mediaType, &filename)
-
-		if err != nil {
-			return false, "", "", "", fmt.Errorf("failed to find message: %v", err)
-		}
-	}
-
-	// Check if this is a media message
-	if mediaType == "" {
-		return false, "", "", "", fmt.Errorf("not a media message")
-	}
-
-	// Create directory for the chat if it doesn't exist
-	if err := os.MkdirAll(chatDir, 0700); err != nil {
-		return false, "", "", "", fmt.Errorf("failed to create chat directory: %v", err)
-	}
-
-	// Generate a local path for the file
-	filename = filepath.Base(filename) // a document name from a chat must not leave chatDir
-	if filename == "." || filename == ".." || filename == string(filepath.Separator) {
-		return false, "", "", "", fmt.Errorf("bad media filename")
-	}
-	localPath = filepath.Join(chatDir, filename)
-
-	// Get absolute path
-	absPath, err := filepath.Abs(localPath)
-	if err != nil {
-		return false, "", "", "", fmt.Errorf("failed to get absolute path: %v", err)
-	}
-
-	// Check if file already exists
-	if _, err := os.Stat(localPath); err == nil {
-		// File exists, return it
-		return true, mediaType, filename, absPath, nil
-	}
-
-	// If we don't have all the media info we need, we can't download
-	if url == "" || len(mediaKey) == 0 || len(fileSHA256) == 0 || len(fileEncSHA256) == 0 || fileLength == 0 {
-		return false, "", "", "", fmt.Errorf("incomplete media information for download")
-	}
-
-	fmt.Printf("%s download media for message %s in chat %s\n", stamp(), messageID, chatJID)
-
-	// Extract direct path from URL
-	directPath := extractDirectPathFromURL(url)
-
-	// Create a downloader that implements DownloadableMessage
-	var waMediaType whatsmeow.MediaType
-	switch mediaType {
-	case "image":
-		waMediaType = whatsmeow.MediaImage
-	case "video":
-		waMediaType = whatsmeow.MediaVideo
-	case "audio":
-		waMediaType = whatsmeow.MediaAudio
-	case "document":
-		waMediaType = whatsmeow.MediaDocument
-	default:
-		return false, "", "", "", fmt.Errorf("unsupported media type: %s", mediaType)
-	}
-
-	downloader := &MediaDownloader{
-		URL:           url,
-		DirectPath:    directPath,
-		MediaKey:      mediaKey,
-		FileLength:    fileLength,
-		FileSHA256:    fileSHA256,
-		FileEncSHA256: fileEncSHA256,
-		MediaType:     waMediaType,
-	}
-
-	// Download the media using whatsmeow client
-	mediaData, err := client.Download(context.Background(), downloader)
-	if err != nil {
-		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
-	}
-
-	// Save the downloaded media to file
-	if err := os.WriteFile(localPath, mediaData, 0600); err != nil {
-		return false, "", "", "", fmt.Errorf("failed to save media file: %v", err)
-	}
-
-	fmt.Printf("%s downloaded %s media to %s (%d bytes)\n", stamp(), mediaType, absPath, len(mediaData))
-	return true, mediaType, filename, absPath, nil
-}
-
-// Extract direct path from a WhatsApp media URL
-func extractDirectPathFromURL(url string) string {
-	// The direct path is typically in the URL, we need to extract it
-	// Example URL: https://mmg.whatsapp.net/v/t62.7118-24/13812002_698058036224062_3424455886509161511_n.enc?ccb=11-4&oh=...
-
-	// Find the path part after the domain
-	parts := strings.SplitN(url, ".net/", 2)
-	if len(parts) < 2 {
-		return url // Return original URL if parsing fails
-	}
-
-	pathPart := parts[1]
-
-	// Remove query parameters
-	pathPart = strings.SplitN(pathPart, "?", 2)[0]
-
-	// Create proper direct path format
-	return "/" + pathPart
-}
-
-// Start a REST API server to expose the WhatsApp client functionality
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
-	// Handler for downloading media
-	http.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
-		// Only allow POST requests
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		// Parse the request body
-		var req DownloadMediaRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "Invalid request format", http.StatusBadRequest)
-			return
-		}
-
-		// Validate request
-		if req.MessageID == "" || req.ChatJID == "" {
-			http.Error(w, "Message ID and Chat JID are required", http.StatusBadRequest)
-			return
-		}
-
-		// Download the media
-		success, mediaType, filename, path, err := downloadMedia(client, messageStore, req.MessageID, req.ChatJID)
-
-		// Set response headers
-		w.Header().Set("Content-Type", "application/json")
-
-		// Handle download result
-		if !success || err != nil {
-			errMsg := "Unknown error"
-			if err != nil {
-				errMsg = err.Error()
-			}
-
-			w.WriteHeader(http.StatusInternalServerError)
-			json.NewEncoder(w).Encode(DownloadMediaResponse{
-				Success: false,
-				Message: fmt.Sprintf("Failed to download media: %s", errMsg),
-			})
-			return
-		}
-
-		// Send successful response
-		json.NewEncoder(w).Encode(DownloadMediaResponse{
-			Success:  true,
-			Message:  fmt.Sprintf("Successfully downloaded %s media", mediaType),
-			Filename: filename,
-			Path:     path,
-		})
-	})
-
-	// Start the server on the loopback interface only: never reachable from
-	// the network. It has no send endpoint; /api/download is the only route.
-	serverAddr := fmt.Sprintf("127.0.0.1:%d", port)
-	fmt.Printf("%s REST API (download only) on %s\n", stamp(), serverAddr)
-
-	// Run server in a goroutine so it doesn't block
-	go func() {
-		if err := http.ListenAndServe(serverAddr, nil); err != nil {
-			fmt.Printf("%s REST API server error: %v\n", stamp(), err)
-		}
-	}()
 }
 
 // Exit codes (launchd restarts the bridge after any exit; see ThrottleInterval).
@@ -622,13 +354,12 @@ func isTerminal() bool {
 func main() {
 	link := flag.Bool("link", false, "pair with the phone: print the QR code to this terminal if the store has no session")
 	debug := flag.Bool("debug", false, "log debug lines (message ids and chat names, never message text)")
-	port := flag.Int("port", 8080, "REST API port on 127.0.0.1 (download only)")
 	flag.Usage = func() {
-		fmt.Fprintf(flag.CommandLine.Output(), `Usage: %s [-link] [-debug] [-port N]
+		fmt.Fprintf(flag.CommandLine.Output(), `Usage: %s [-link] [-debug]
 
 Read-only WhatsApp bridge for James. Links as a companion device, stores
-chats and messages in $WHATSAPP_STORE_DIR/messages.db (default ./store),
-and serves /api/download on 127.0.0.1 only. It has no send path.
+chats and messages in $WHATSAPP_STORE_DIR/messages.db (default ./store).
+It has no send path, never downloads media and opens no network listener.
 
 Without a session it prints the pairing QR only when stdout is a terminal
 or -link is given; under launchd it logs "not linked" and exits %d.
@@ -779,9 +510,6 @@ Exit codes: 0 ok, 2 usage, 3 not linked, 4 logged out, 5 store error, 6 connect 
 	}
 
 	logger.Infof("Connected; storing messages in %s", filepath.Join(storeDir, "messages.db"))
-
-	// Start REST API server (loopback, download only)
-	startRESTServer(client, messageStore, *port)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
